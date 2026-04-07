@@ -138,6 +138,8 @@ LiteFS tự acquire Consul lock mới → node mới trở thành primary.
 | `BOOTSTRAP_DISCOVERY_ROUNDS` | `20` | Số vòng discovery seed trước khi chốt. |
 | `BOOTSTRAP_STABLE_ROUNDS` | `3` | Số vòng seed phải ổn định để giảm race condition. |
 | `BOOTSTRAP_RECOVERY_STEP_SECONDS` | `10` | Bước delay theo rank khi cluster chưa có leader để tránh nhiều node bootstrap đồng thời. |
+| `BOOTSTRAP_LEADER_WAIT_SECONDS` | `90` | Thời gian chờ leader xuất hiện sau khi Consul local đã up. |
+| `CONSUL_AUTO_RECOVER_NO_LEADER` | `true` | Nếu vẫn không có leader, reset local Consul state và thử lại 1 lần. |
 | `BACKUP_ENABLED` | `false` | Bật/tắt backup định kỳ lên S3. |
 | `BACKUP_INTERVAL_SECONDS` | `300` | Chu kỳ backup (giây). |
 | `BACKUP_S3_BUCKET` | _(rỗng)_ | Bucket S3 để lưu snapshot SQLite. |
@@ -157,6 +159,7 @@ LiteFS tự acquire Consul lock mới → node mới trở thành primary.
 - Node cần ~15-30s để Tailscale fully up
 - Bootstrap script có startup gate + seed ổn định nhiều vòng để giảm race
 - Xem logs: `docker logs litefs-node-a | grep BOOTSTRAP`
+- Nếu thấy kẹt `No cluster leader`, script mới sẽ tự thử no-leader recovery (reset local state 1 lần).
 
 ### LiteFS không mount
 - Cần `--privileged` trong docker run

@@ -178,6 +178,29 @@ wait_local_consul_ready() {
     exit 1
 }
 
+
+wait_cluster_leader() {
+    local timeout="${1:-120}"
+    local i=0 resp
+    while [ "$i" -lt "$timeout" ]; do
+        resp=$(leader_of_ip "127.0.0.1")
+        if has_real_leader_value "$resp"; then
+            echo "$resp"
+            return 0
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    return 1
+}
+
+reset_local_consul_state() {
+    log "Reset local Consul state (no-leader recovery)..."
+    pkill -f "consul agent" 2>/dev/null || true
+    sleep 2
+    rm -rf /var/lib/consul/*
+}
+
 main() {
     log "══════════════════════════════════════════"
     log "  LiteFS Node Bootstrap"
@@ -189,37 +212,69 @@ main() {
     log "Initial anti-race backoff: ${backoff}s"
     sleep "$backoff"
 
-    local seed existing_leader
+    local seed existing_leader mode
     seed=$(wait_seed_stable)
     [ -z "$seed" ] && seed="$MY_IP"
 
     if existing_leader=$(find_existing_leader); then
         log "Detected existing leader in cluster: $existing_leader"
-        start_consul_process "follower"
-        wait_local_consul_ready
-        log "Consul join completed"
-        exit 0
-    fi
-
-    # Không có leader: chạy election gate theo rank để 1 node bootstrap trước.
-    local rank step delay
-    rank=$(rank_of_self)
-    step="${BOOTSTRAP_RECOVERY_STEP_SECONDS:-10}"
-    delay=$(( (rank - 1) * step ))
-    log "No leader detected. Recovery gate: rank=$rank, delay=${delay}s"
-    sleep "$delay"
-
-    # Re-check leader sau delay để tránh nhiều node bootstrap cùng lúc.
-    if existing_leader=$(find_existing_leader); then
-        log "Leader appeared during recovery wait: $existing_leader"
+        mode="follower"
         start_consul_process "follower"
     else
-        log "Still no leader after recovery wait → bootstrap self"
-        start_consul_process "leader"
+        local rank step delay
+        rank=$(rank_of_self)
+        step="${BOOTSTRAP_RECOVERY_STEP_SECONDS:-10}"
+        delay=$(( (rank - 1) * step ))
+        log "No leader detected. Recovery gate: rank=$rank, delay=${delay}s"
+        sleep "$delay"
+
+        if existing_leader=$(find_existing_leader); then
+            log "Leader appeared during recovery wait: $existing_leader"
+            mode="follower"
+            start_consul_process "follower"
+        else
+            log "Still no leader after recovery wait → bootstrap self"
+            mode="leader"
+            start_consul_process "leader"
+        fi
     fi
 
     wait_local_consul_ready
-    log "Consul bootstrap flow completed"
+
+    local final_leader
+    if final_leader=$(wait_cluster_leader "${BOOTSTRAP_LEADER_WAIT_SECONDS:-90}"); then
+        log "✓ Cluster leader elected: $final_leader"
+        log "Consul bootstrap flow completed"
+        exit 0
+    fi
+
+    log "⚠ Cluster still has no leader after wait window"
+    if [ "${CONSUL_AUTO_RECOVER_NO_LEADER:-true}" != "true" ]; then
+        err "CONSUL_AUTO_RECOVER_NO_LEADER=false, stop here"
+        exit 1
+    fi
+
+    # Auto-recovery: reset local raft state và thử lại 1 lần.
+    reset_local_consul_state
+
+    if [ "$mode" = "leader" ]; then
+        log "Retry as LEADER after local reset"
+        start_consul_process "leader"
+    else
+        log "Retry as FOLLOWER after local reset"
+        start_consul_process "follower"
+    fi
+
+    wait_local_consul_ready
+    if final_leader=$(wait_cluster_leader "${BOOTSTRAP_LEADER_WAIT_SECONDS:-90}"); then
+        log "✓ Cluster leader elected after recovery: $final_leader"
+        log "Consul bootstrap flow completed"
+        exit 0
+    fi
+
+    err "Cluster still has no leader after recovery retry"
+    tail -40 /var/log/consul.log >&2 || true
+    exit 1
 }
 
 main "$@"
