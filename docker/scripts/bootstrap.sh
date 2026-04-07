@@ -1,7 +1,5 @@
 #!/bin/bash
-# bootstrap.sh — Khởi động Consul theo cơ chế seed động, hỗ trợ 1..N node.
-# - Nếu chỉ có 1 node online: node đó tự bootstrap leader.
-# - Nếu nhiều node: chọn seed xác định (IP nhỏ nhất) để bootstrap, node khác join follower.
+# bootstrap.sh — Khởi động Consul cho 1..N node, có cơ chế recovery khi cluster "no leader".
 set -euo pipefail
 
 TS_TAG="${TS_TAG:-tag:litefs-node}"
@@ -43,17 +41,30 @@ all_known_nodes() {
     } | awk 'NF' | sort -u
 }
 
-consul_alive_local() {
-    local resp
-    resp=$(curl -sf --connect-timeout 2 --max-time 4 \
-        "http://127.0.0.1:8500/v1/status/leader" 2>/dev/null || true)
-    [[ "$resp" =~ ^\"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+\"$ ]]
+leader_of_ip() {
+    local ip="$1"
+    curl -sf --connect-timeout 2 --max-time 4 "http://${ip}:8500/v1/status/leader" 2>/dev/null || true
+}
+
+has_real_leader_value() {
+    local leader="$1"
+    [[ "$leader" =~ ^\"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+\"$ ]]
+}
+
+find_existing_leader() {
+    local nodes leader
+    nodes=$(all_known_nodes)
+    for ip in $nodes; do
+        leader=$(leader_of_ip "$ip")
+        if has_real_leader_value "$leader"; then
+            echo "$leader"
+            return 0
+        fi
+    done
+    return 1
 }
 
 wait_seed_stable() {
-    # Startup gate chống race/split-brain:
-    # Chọn seed là IP nhỏ nhất trong tập node online (self + peers).
-    # Chỉ chốt seed khi giá trị ổn định N vòng liên tiếp.
     local rounds="${BOOTSTRAP_DISCOVERY_ROUNDS:-20}"
     local stable_need="${BOOTSTRAP_STABLE_ROUNDS:-3}"
     local sleep_s="${BOOTSTRAP_DISCOVERY_INTERVAL:-3}"
@@ -66,10 +77,7 @@ wait_seed_stable() {
         local nodes seed
         nodes=$(all_known_nodes)
         seed=$(echo "$nodes" | sort -V | head -n1)
-
-        if [ -z "$seed" ]; then
-            seed="$MY_IP"
-        fi
+        [ -z "$seed" ] && seed="$MY_IP"
 
         if [ "$seed" = "$prev" ]; then
             stable=$((stable + 1))
@@ -78,7 +86,7 @@ wait_seed_stable() {
             prev="$seed"
         fi
 
-        log "Discovery round $i/$rounds | seed=$seed | stable=$stable/$stable_need | nodes=$(echo "$nodes" | tr '\n' ' ')"
+        log "Discovery $i/$rounds | seed=$seed | stable=$stable/$stable_need | nodes=$(echo "$nodes" | tr '\n' ' ')"
 
         if [ "$stable" -ge "$stable_need" ]; then
             echo "$seed"
@@ -89,18 +97,29 @@ wait_seed_stable() {
         i=$((i + 1))
     done
 
-    # Timeout thì vẫn trả seed cuối để hệ thống tiến lên (ưu tiên availability).
     echo "$prev"
 }
 
-start_consul() {
-    local seed_ip="$1"
-    local mode="$2" # leader | follower
+rank_of_self() {
+    local nodes rank=1 ip
+    nodes=$(all_known_nodes | sort -V)
+    for ip in $nodes; do
+        if [ "$ip" = "$MY_IP" ]; then
+            echo "$rank"
+            return 0
+        fi
+        rank=$((rank + 1))
+    done
+    echo "1"
+}
+
+start_consul_process() {
+    local mode="$1" # leader|follower
+    local explicit_join="${2:-}"
 
     local node_name="${NODE_NAME:-litefs-$(hostname | cut -c1-12)}"
     local retry_flags=()
 
-    # Luôn retry-join tất cả peers đang thấy để tăng khả năng hội tụ.
     local peers
     peers=$(get_online_peers || true)
     for p in $peers; do
@@ -108,18 +127,16 @@ start_consul() {
         retry_flags+=("-retry-join=$p")
     done
 
-    # Follower luôn có seed_ip trong retry-join để bám seed chắc chắn.
-    if [ "$mode" = "follower" ] && [ -n "$seed_ip" ]; then
-        retry_flags+=("-retry-join=$seed_ip")
+    if [ -n "$explicit_join" ]; then
+        retry_flags+=("-retry-join=$explicit_join")
     fi
 
     local mode_flags=()
     if [ "$mode" = "leader" ]; then
-        # Node seed tự bootstrap ngay cả khi hiện tại chỉ có 1 node.
         mode_flags+=("-bootstrap-expect=1")
-        log "Mode: LEADER (seed bootstrap) | seed=$seed_ip"
+        log "Mode: LEADER (self-bootstrap)"
     else
-        log "Mode: FOLLOWER (join seed) | seed=$seed_ip"
+        log "Mode: FOLLOWER (retry-join peers)"
     fi
 
     consul agent \
@@ -140,23 +157,23 @@ start_consul() {
 
     local consul_pid=$!
     log "Consul started (PID: $consul_pid)"
+}
 
+wait_local_consul_ready() {
     log "Waiting for local Consul API ready..."
-    local i=0
+    local i=0 resp
     while [ "$i" -lt 60 ]; do
-        if consul_alive_local; then
-            log "✓ Consul is ready"
+        resp=$(leader_of_ip "127.0.0.1")
+        # API có thể ready dù chưa có leader, nên chỉ cần resp là string JSON
+        if [[ "$resp" =~ ^\" ]]; then
+            log "✓ Local Consul API reachable (leader=$resp)"
             return 0
-        fi
-        if (( i % 10 == 9 )); then
-            log "  Still waiting... (${i}s / 180s)"
-            tail -3 /var/log/consul.log 2>/dev/null | sed 's/^/    /' || true
         fi
         sleep 3
         i=$((i + 1))
     done
 
-    err "Consul NOT ready after timeout. Last logs:"
+    err "Local Consul API not ready after timeout"
     tail -30 /var/log/consul.log >&2 || true
     exit 1
 }
@@ -168,21 +185,40 @@ main() {
 
     wait_tailscale
 
-    # Backoff nhẹ để giảm burst đồng thời từ CI/orchestrator.
     local backoff=$(( (RANDOM % 4) + 1 ))
-    log "Anti-race initial backoff: ${backoff}s"
+    log "Initial anti-race backoff: ${backoff}s"
     sleep "$backoff"
 
-    local seed
+    local seed existing_leader
     seed=$(wait_seed_stable)
     [ -z "$seed" ] && seed="$MY_IP"
 
-    if [ "$seed" = "$MY_IP" ]; then
-        start_consul "$seed" "leader"
-    else
-        start_consul "$seed" "follower"
+    if existing_leader=$(find_existing_leader); then
+        log "Detected existing leader in cluster: $existing_leader"
+        start_consul_process "follower"
+        wait_local_consul_ready
+        log "Consul join completed"
+        exit 0
     fi
 
+    # Không có leader: chạy election gate theo rank để 1 node bootstrap trước.
+    local rank step delay
+    rank=$(rank_of_self)
+    step="${BOOTSTRAP_RECOVERY_STEP_SECONDS:-10}"
+    delay=$(( (rank - 1) * step ))
+    log "No leader detected. Recovery gate: rank=$rank, delay=${delay}s"
+    sleep "$delay"
+
+    # Re-check leader sau delay để tránh nhiều node bootstrap cùng lúc.
+    if existing_leader=$(find_existing_leader); then
+        log "Leader appeared during recovery wait: $existing_leader"
+        start_consul_process "follower"
+    else
+        log "Still no leader after recovery wait → bootstrap self"
+        start_consul_process "leader"
+    fi
+
+    wait_local_consul_ready
     log "Consul bootstrap flow completed"
 }
 

@@ -137,13 +137,14 @@ LiteFS tự acquire Consul lock mới → node mới trở thành primary.
 | `TS_TAGS` | `tag:litefs-node` | Tag dùng để discover peer. |
 | `BOOTSTRAP_DISCOVERY_ROUNDS` | `20` | Số vòng discovery seed trước khi chốt. |
 | `BOOTSTRAP_STABLE_ROUNDS` | `3` | Số vòng seed phải ổn định để giảm race condition. |
+| `BOOTSTRAP_RECOVERY_STEP_SECONDS` | `10` | Bước delay theo rank khi cluster chưa có leader để tránh nhiều node bootstrap đồng thời. |
 | `BACKUP_ENABLED` | `false` | Bật/tắt backup định kỳ lên S3. |
 | `BACKUP_INTERVAL_SECONDS` | `300` | Chu kỳ backup (giây). |
 | `BACKUP_S3_BUCKET` | _(rỗng)_ | Bucket S3 để lưu snapshot SQLite. |
 | `BACKUP_S3_PREFIX` | `litefs` | Prefix object key trong bucket. |
 | `AWS_REGION` | `us-east-1` | Region dùng cho lệnh `aws s3 cp`. |
 
-> Lưu ý: cơ chế bootstrap mới là seed động theo IP nhỏ nhất trong các node online cùng tag. Nếu chỉ có 1 node online, node đó tự bootstrap leader; node đến sau sẽ tự join và khi leader hiện tại rời cụm, các server còn lại sẽ tham gia bầu leader mới (theo quorum của Consul).
+> Lưu ý: cơ chế bootstrap mới dùng discovery + recovery gate. Nếu đã có leader thì node mới chỉ join follower. Nếu chưa có leader, các node sẽ chờ theo rank IP để chỉ một node bootstrap trước; nhờ đó giảm tình huống toàn cụm kẹt `No cluster leader`.
 
 ## Troubleshooting
 
