@@ -124,8 +124,26 @@ LiteFS tự acquire Consul lock mới → node mới trở thành primary.
         ├── entrypoint.sh ← Start tailscaled → bootstrap → litefs
         ├── bootstrap.sh  ← Discover peers, start Consul leader/follower
         ├── run-app.sh    ← App chạy qua LiteFS exec (heartbeat loop)
-        └── verify.sh     ← Chứng minh cluster hoạt động
+        ├── verify.sh     ← Chứng minh cluster hoạt động
+        └── backup.sh     ← Snapshot SQLite định kỳ lên S3 (optional)
 ```
+
+
+## Biến môi trường quan trọng
+
+| Biến | Mặc định | Mô tả |
+|---|---|---|
+| `TS_AUTHKEY` | _(bắt buộc)_ | Auth key Tailscale để node tham gia tailnet. |
+| `TS_TAGS` | `tag:litefs-node` | Tag dùng để discover peer. |
+| `BOOTSTRAP_DISCOVERY_ROUNDS` | `20` | Số vòng discovery seed trước khi chốt. |
+| `BOOTSTRAP_STABLE_ROUNDS` | `3` | Số vòng seed phải ổn định để giảm race condition. |
+| `BACKUP_ENABLED` | `false` | Bật/tắt backup định kỳ lên S3. |
+| `BACKUP_INTERVAL_SECONDS` | `300` | Chu kỳ backup (giây). |
+| `BACKUP_S3_BUCKET` | _(rỗng)_ | Bucket S3 để lưu snapshot SQLite. |
+| `BACKUP_S3_PREFIX` | `litefs` | Prefix object key trong bucket. |
+| `AWS_REGION` | `us-east-1` | Region dùng cho lệnh `aws s3 cp`. |
+
+> Lưu ý: cơ chế bootstrap mới là seed động theo IP nhỏ nhất trong các node online cùng tag. Nếu chỉ có 1 node online, node đó tự bootstrap leader; node đến sau sẽ tự join và khi leader hiện tại rời cụm, các server còn lại sẽ tham gia bầu leader mới (theo quorum của Consul).
 
 ## Troubleshooting
 
@@ -136,7 +154,7 @@ LiteFS tự acquire Consul lock mới → node mới trở thành primary.
 
 ### Consul không join được
 - Node cần ~15-30s để Tailscale fully up
-- Bootstrap script có random backoff 3-14s để tránh race
+- Bootstrap script có startup gate + seed ổn định nhiều vòng để giảm race
 - Xem logs: `docker logs litefs-node-a | grep BOOTSTRAP`
 
 ### LiteFS không mount
@@ -147,4 +165,4 @@ LiteFS tự acquire Consul lock mới → node mới trở thành primary.
 ### Split-brain (2 node đều là leader)
 - Xảy ra khi 2 node khởi động đúng cùng lúc và không thấy nhau
 - Fix: stop 1 trong 2 node, restart nó
-- Phòng ngừa: random backoff đã giảm xác suất này xuống rất thấp
+- Phòng ngừa: startup gate + seed ổn định giúp giảm xác suất split-brain ngắn hạn

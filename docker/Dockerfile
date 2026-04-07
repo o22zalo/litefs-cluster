@@ -7,7 +7,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 # ── Base packages ─────────────────────────────────────────────────────────────
 RUN apt-get update && apt-get install -y \
-    curl wget jq sqlite3 fuse3 ca-certificates \
+    curl wget jq sqlite3 fuse3 ca-certificates awscli \
     iproute2 iptables net-tools unzip gnupg \
     && rm -rf /var/lib/apt/lists/*
 
@@ -59,11 +59,13 @@ COPY docker/scripts/entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY docker/scripts/bootstrap.sh  /usr/local/bin/bootstrap.sh
 COPY docker/scripts/run-app.sh    /usr/local/bin/run-app.sh
 COPY docker/scripts/verify.sh     /usr/local/bin/verify.sh
+COPY docker/scripts/backup.sh     /usr/local/bin/backup.sh
 
 RUN chmod +x \
     /usr/local/bin/entrypoint.sh \
     /usr/local/bin/bootstrap.sh \
     /usr/local/bin/run-app.sh \
-    /usr/local/bin/verify.sh
+    /usr/local/bin/verify.sh \
+    /usr/local/bin/backup.sh
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
