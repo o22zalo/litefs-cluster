@@ -54,28 +54,22 @@ consul_alive_on() {
 }
 
 # ── 4. Tìm peer có Consul đang chạy ──────────────────────────────────────────
-find_active_peer() {
-    local peers
-    peers=$(get_peers)
-
-    if [ -z "$peers" ]; then
-        info "No online peers found with tag: $TS_TAG"
-        return 1
-    fi
-
-    info "Online peers: $(echo "$peers" | tr '\n' ' ')"
-
-    local ip
-    for ip in $peers; do
-        info "  Checking Consul @ $ip..."
-        if consul_alive_on "$ip"; then
-            info "  ✓ Active Consul found at: $ip"
-            echo "$ip"
+# Chờ có ít nhất 1 peer online trước khi start Consul
+wait_for_peers() {
+    log "Waiting for at least 1 peer online..."
+    local i=0
+    while [ $i -lt 60 ]; do
+        local peers
+        peers=$(get_peers)
+        if [ -n "$peers" ]; then
+            log "✓ Found peers: $(echo $peers | tr '\n' ' ')"
+            echo "$peers"
             return 0
         fi
-        info "  ✗ No Consul at: $ip"
+        sleep 5
+        i=$((i + 1))
     done
-
+    log "No peers found after 300s — will bootstrap alone with expect=2"
     return 1
 }
 
@@ -154,24 +148,24 @@ start_consul_old() {
 }
 start_consul() {
     local my_ip="$1"
-    local peers="$2"   # space-separated list
+    local peers="$2"
 
     local retry_flags=()
     for p in $peers; do
         retry_flags+=("-retry-join=$p")
     done
-    # Nếu không có peer, self-join (sẽ chờ bootstrap-expect)
-    [ ${#retry_flags[@]} -eq 0 ] && retry_flags+=("-retry-join=$my_ip")
 
     consul agent \
         -server \
-        -bootstrap-expect=3 \
+        -bootstrap-expect=2 \
         -bind="$my_ip" \
         -advertise="$my_ip" \
         -client="0.0.0.0" \
         -data-dir="/var/lib/consul" \
         -config-dir="/etc/consul.d" \
         -log-level="WARN" \
+        -retry-interval=10s \
+        -retry-max=60 \
         "${retry_flags[@]}" \
         >> /var/log/consul.log 2>&1 &
 }
@@ -183,40 +177,94 @@ main() {
 
     wait_tailscale
 
-    # Anti-race: random backoff để tránh 2 node cùng bootstrap song song
-    # Nếu không có backoff, 2 node khởi động cùng lúc đều thấy "no peer"
-    # và cùng chạy -bootstrap → split-brain
-    local backoff=$(( (RANDOM % 12) + 3 ))  # 3–14 giây
+    # Anti-race backoff
+    local backoff=$(( (RANDOM % 12) + 3 ))
     log "Anti-race backoff: ${backoff}s..."
     sleep "$backoff"
 
-    # Refresh IP sau backoff (đảm bảo vẫn còn)
+    # Refresh IP sau backoff
     MY_IP=$(tailscale ip -4 2>/dev/null) || { err "Lost Tailscale IP"; exit 1; }
 
-    # Thử tìm peer 2 lần (lần 2 cách 8s) để tăng khả năng phát hiện
-    local peer=""
+    # Tìm peers qua Tailscale tag
+    log "Searching for peers with tag: $TS_TAG..."
+    local peers=""
     local attempt
-    for attempt in 1 2; do
-        # SAU — bỏ 2>/dev/null để info() ra stderr hiển thị, stdout chỉ có IP
-        peer=$(find_active_peer || true)
-        [ -n "$peer" ] && break
-        if [ $attempt -lt 2 ]; then
-            log "Peer check attempt $attempt failed. Retry in 8s..."
-            sleep 8
+    for attempt in 1 2 3; do
+        peers=$(get_peers || true)
+        if [ -n "$peers" ]; then
+            log "✓ Found peers (attempt $attempt): $(echo $peers | tr '\n' ' ')"
+            break
         fi
+        log "Peer check attempt $attempt failed. Retry in 10s..."
+        sleep 10
     done
 
-    if [ -n "$peer" ]; then
-        start_consul "$MY_IP" "follower" "$peer"
-    else
-        start_consul "$MY_IP" "leader"
+    if [ -z "$peers" ]; then
+        log "No peers found — will bootstrap alone (waiting for others via retry-join)"
+    fi
+
+    # Build retry-join flags từ peers tìm được
+    local retry_flags=()
+    for p in $peers; do
+        retry_flags+=("-retry-join=$p")
+    done
+
+    # Node bootstrap alone vẫn cần 1 retry-join (chính nó) để Consul không complain
+    # bootstrap-expect=2 sẽ block elect cho đến khi có peer join
+    if [ ${#retry_flags[@]} -eq 0 ]; then
+        log "No retry-join targets — Consul will wait for peers to connect"
+    fi
+
+    # Start Consul — tất cả nodes đều dùng bootstrap-expect=2
+    local node_name="litefs-$(hostname | cut -c1-12)"
+    log "Starting Consul (node: $node_name, expect=2)..."
+
+    consul agent \
+        -server \
+        -ui \
+        -node="$node_name" \
+        -bind="$MY_IP" \
+        -advertise="$MY_IP" \
+        -client="0.0.0.0" \
+        -data-dir="/var/lib/consul" \
+        -config-dir="/etc/consul.d" \
+        -log-level="WARN" \
+        -bootstrap-expect=2 \
+        -retry-interval=10s \
+        -retry-max=60 \
+        "${retry_flags[@]}" \
+        >> /var/log/consul.log 2>&1 &
+
+    local consul_pid=$!
+    log "Consul started (PID: $consul_pid)"
+
+    # Chờ Consul ready
+    log "Waiting for Consul to become ready (may take up to 120s while waiting for quorum)..."
+    local i=0
+    while [ $i -lt 40 ]; do
+        if consul_alive_on "127.0.0.1"; then
+            log "✓ Consul is ready"
+            break
+        fi
+        if (( i % 5 == 4 )); then
+            log "  Still waiting... (${i}s / 120s)"
+            tail -3 /var/log/consul.log 2>/dev/null | sed 's/^/    /' || true
+        fi
+        sleep 3
+        i=$((i + 1))
+    done
+
+    if ! consul_alive_on "127.0.0.1"; then
+        err "Consul NOT ready after 120s. Last logs:"
+        tail -20 /var/log/consul.log >&2
+        exit 1
     fi
 
     # Summary
     log "══════════════════════════════════════════"
     log "  Bootstrap Complete"
     log "  Node IP   : $MY_IP"
-    log "  Role      : $([ -n "$peer" ] && echo "FOLLOWER (joined $peer)" || echo "LEADER")"
+    log "  Peers     : $([ -n "$peers" ] && echo "$peers" | tr '\n' ' ' || echo "none (bootstrapping alone)")"
     log "  Leader    : $(curl -s http://127.0.0.1:8500/v1/status/leader 2>/dev/null || echo '?')"
     log "══════════════════════════════════════════"
     consul members 2>/dev/null | sed 's/^/  /' || true
